@@ -133,7 +133,7 @@ Claude: Готово: контрагент 00-000123, счёт № … (черн
 
 ## Инструменты
 
-56 инструментов (21 чтение/аналитика + 35 записей). У всех есть необязательный параметр **`database`** (какая база 1С — см. `read.system.list_databases`); у аналитических — ещё и **`organization`** (фильтр по юрлицу — см. `read.system.list_organizations`).
+57 инструментов (22 чтение/аналитика + 35 записей). У всех есть необязательный параметр **`database`** (какая база 1С — см. `read.system.list_databases`); у аналитических — ещё и **`organization`** (фильтр по юрлицу — см. `read.system.list_organizations`).
 
 **Чтение и аналитика:**
 
@@ -145,6 +145,7 @@ Claude: Готово: контрагент 00-000123, счёт № … (черн
 | `read.counterparty.find_counterparty` / `read.counterparty.get_counterparty` | Поиск контрагента (по названию/ИНН) и его карточка |
 | `read.document.search_documents` / `read.document.get_document` | Поиск документов и документ с табличной частью |
 | `read.analytics.get_debtors` / `read.analytics.get_inventory` | Дебиторка (сч. 62) / остатки товаров (сч. 41/10/43), можно на дату в прошлом (`asOf`) |
+| `read.accounting.get_account_turnover` | ОСВ по счёту за период (`51`, `60`, `90.01`…): сальдо на начало/конец и обороты Дт/Кт, итогом и по субсчетам |
 | `read.analytics.get_sales` / `read.analytics.get_cashflow` | Продажи за период / движение денег (банк + касса) |
 | `read.analytics.get_sales_breakdown` / `read.analytics.get_purchases_breakdown` | Продажи/закупки с разбивкой по контрагенту, месяцу, договору, категории (ИП/ЮрЛицо/…) |
 | `read.analytics.get_payments_breakdown` | Приход/расход по виду операции, месяцу, контрагенту, статье ДДС — «сколько заплатили ИП за год», «проценты по депозиту» |

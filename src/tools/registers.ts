@@ -4,7 +4,15 @@ import type { Connection, ServerContext } from "../context.js";
 import { ok, fail, guard, databaseField, organizationField, dateField } from "./_shared.js";
 import { and, cmp, odataGuid } from "../odata/query.js";
 import { ACCOUNT_PREFIX, CATALOGS, DOC_FIELDS, DOCUMENTS, resolveEntity } from "../config/mapping.js";
-import { balanceByAccounts, resolveAccounts, resolveNames, num } from "../odata/accounting.js";
+import {
+  balanceByAccounts,
+  resolveAccounts,
+  resolveNames,
+  num,
+  turnoversByAccounts,
+  BALANCE_AND_TURNOVERS,
+  type Account,
+} from "../odata/accounting.js";
 import { resolveOrganization } from "../odata/orgs.js";
 import { collectDocuments, emptyMeta, addMeta, type ScanMeta } from "../odata/aggregate.js";
 import {
@@ -12,7 +20,10 @@ import {
   getCashflowResultSchema,
   getDebtorsResultSchema,
   getInventoryResultSchema,
+  getAccountTurnoverResultSchema,
 } from "../schemas/output.js";
+import { InputError } from "../errors.js";
+import type { ODataEntity } from "../types/odata.js";
 
 // Деньги копим в целых копейках (float-сложение тысяч сумм даёт дрейф).
 const toCents = (v: unknown): number => Math.round(num(v) * 100);
@@ -58,6 +69,81 @@ async function sumDocuments(
     totalCents += c;
   }
   return { totalCents, perSet, usedSets, meta };
+}
+
+/** Код счёта или префикс: «51», «60», «90.01», «90.01.1», забалансовые «МЦ.04», «001». */
+const ACCOUNT_CODE_RE = /^[0-9A-Za-zА-Яа-яЁё]+(\.[0-9A-Za-zА-Яа-яЁё]+)*$/;
+
+/** Сальдо/обороты ОСВ в целых копейках. */
+export interface TurnoverCents {
+  openingDr: number;
+  openingCr: number;
+  turnoverDr: number;
+  turnoverCr: number;
+  closingDr: number;
+  closingCr: number;
+}
+
+const zeroTurnover = (): TurnoverCents => ({
+  openingDr: 0,
+  openingCr: 0,
+  turnoverDr: 0,
+  turnoverCr: 0,
+  closingDr: 0,
+  closingCr: 0,
+});
+
+const turnoverToRub = (t: TurnoverCents) => ({
+  openingDebit: fromCents(t.openingDr),
+  openingCredit: fromCents(t.openingCr),
+  debitTurnover: fromCents(t.turnoverDr),
+  creditTurnover: fromCents(t.turnoverCr),
+  closingDebit: fromCents(t.closingDr),
+  closingCredit: fromCents(t.closingCr),
+});
+
+/**
+ * Сворачивает строки «Остатков и оборотов» в ОСВ: итог и разбивка по субсчетам.
+ * Dr и Cr копятся РАЗДЕЛЬНО по строкам (строка = счёт × измерения × субконто) —
+ * это развёрнутое сальдо, как в стандартной ОСВ по счёту с аналитикой.
+ * Всё в целых копейках — без float-дрейфа.
+ */
+export function aggregateAccountTurnover(
+  rows: readonly ODataEntity[],
+  accounts: readonly Account[],
+): {
+  total: TurnoverCents;
+  byAccount: Array<{ account: Account; sums: TurnoverCents }>;
+  consistent: boolean;
+} {
+  const f = BALANCE_AND_TURNOVERS.fields;
+  const total = zeroTurnover();
+  const per = new Map<string, TurnoverCents>();
+  for (const r of rows) {
+    const key = String(r["Account_Key"] ?? "");
+    const acc = per.get(key) ?? zeroTurnover();
+    const add = (k: keyof TurnoverCents, field: string): void => {
+      const c = toCents(r[field]);
+      acc[k] += c;
+      total[k] += c;
+    };
+    add("openingDr", f.openingDr);
+    add("openingCr", f.openingCr);
+    add("turnoverDr", f.turnoverDr);
+    add("turnoverCr", f.turnoverCr);
+    add("closingDr", f.closingDr);
+    add("closingCr", f.closingCr);
+    per.set(key, acc);
+  }
+  // Субсчета — в порядке плана счетов; без движений и остатков не показываем.
+  const byAccount = accounts
+    .filter((a) => per.has(a.key))
+    .map((a) => ({ account: a, sums: per.get(a.key)! }));
+  // Контроль: Сн + ОбДт − ОбКт = Ск (в копейках, по сальдо «Дт − Кт»).
+  const consistent =
+    total.openingDr - total.openingCr + total.turnoverDr - total.turnoverCr ===
+    total.closingDr - total.closingCr;
+  return { total, byAccount, consistent };
 }
 
 async function orgKeyOf(conn: Connection, organization?: string): Promise<{ key?: string; name?: string }> {
@@ -208,6 +294,77 @@ export function registerRegisterTools(server: McpServer, ctx: ServerContext): vo
           count: debtors.length,
           debtors,
           scan: { rowsScanned: rows.length, elapsedMs: Date.now() - t0 },
+        });
+      }),
+  );
+
+  server.registerTool(
+    "read.accounting.get_account_turnover",
+    {
+      title: "ОСВ по счёту",
+      description:
+        "Оборотно-сальдовая ведомость по бухгалтерскому счёту (регистр бухгалтерии Хозрасчетный, " +
+        "виртуальная таблица «Остатки и обороты») за период: сальдо на начало Дт/Кт, обороты Дт/Кт, " +
+        "сальдо на конец Дт/Кт — итогом и по субсчетам. account — код счёта или префикс " +
+        "(«51», «60», «62», «90.01»): берутся все субсчета, код которых начинается с него. " +
+        "Сальдо развёрнутое по аналитике (измерения и субконто), как в стандартной ОСВ по счёту. " +
+        "Можно ограничить организацией. Период — даты YYYY-MM-DD включительно.",
+      inputSchema: {
+        database: databaseField,
+        organization: organizationField,
+        account: z
+          .string()
+          .trim()
+          .min(1)
+          .max(20)
+          .regex(ACCOUNT_CODE_RE, "Код счёта: цифры/буквы через точку, напр. 51, 60.01, 90.01.1")
+          .describe("Код счёта или префикс субсчетов, напр. 51, 60, 62, 90.01"),
+        from: dateField("Дата начала периода"),
+        to: dateField("Дата конца периода"),
+      },
+      outputSchema: getAccountTurnoverResultSchema,
+    },
+    ({ database, organization, account, from, to }) =>
+      guard("read.accounting.get_account_turnover", async () => {
+        const t0 = Date.now();
+        if (from > to) return fail(`Период задан наоборот: from (${from}) позже to (${to}).`);
+        const conn = ctx.db(database);
+        const org = await orgKeyOf(conn, organization);
+        const accounts = await resolveAccounts(conn, [account]);
+        if (accounts.length === 0) {
+          throw new InputError(`Счёт "${account}" не найден в плане счетов «Хозрасчётный».`);
+        }
+        // resolveAccounts листает до maxRows без сигнала об усечке: упёрлись в потолок —
+        // список субсчетов мог быть неполным, а неполная ОСВ хуже явной ошибки.
+        if (accounts.length >= conn.behavior.maxRows) {
+          throw new InputError(
+            `Под префикс "${account}" подходит слишком много счетов (≥ ${conn.behavior.maxRows}). ` +
+              `Уточните код счёта.`,
+          );
+        }
+        const { rows, meta } = await turnoversByAccounts(
+          conn,
+          accounts.map((a) => a.key),
+          from,
+          to,
+          org.key,
+        );
+        const agg = aggregateAccountTurnover(rows, accounts);
+        return ok({
+          database: conn.cfg.name,
+          organization: org.name,
+          account,
+          period: { from, to },
+          ...turnoverToRub(agg.total),
+          consistent: agg.consistent,
+          accounts: agg.byAccount.map(({ account: a, sums }) => ({
+            code: a.code,
+            description: a.description,
+            ref: a.key,
+            ...turnoverToRub(sums),
+          })),
+          ...(rows.length === 0 ? { note: "За период нет ни остатков, ни движений по счёту." } : {}),
+          scan: { rowsScanned: meta.rowsScanned, windows: meta.chunks, elapsedMs: Date.now() - t0 },
         });
       }),
   );

@@ -264,6 +264,39 @@ export const getInventoryResultSchema = z
   })
   .passthrough();
 
+/** Сальдо/обороты ОСВ в рублях (Dr/Cr раздельно, развёрнуто по аналитике). */
+const turnoverSumsSchema = z
+  .object({
+    openingDebit: z.number(),
+    openingCredit: z.number(),
+    debitTurnover: z.number(),
+    creditTurnover: z.number(),
+    closingDebit: z.number(),
+    closingCredit: z.number(),
+  })
+  .passthrough();
+
+export const getAccountTurnoverResultSchema = z
+  .object({
+    database: z.string(),
+    organization: z.string().optional(),
+    account: z.string(),
+    period: z.object({ from: z.string(), to: z.string() }),
+    openingDebit: z.number(),
+    openingCredit: z.number(),
+    debitTurnover: z.number(),
+    creditTurnover: z.number(),
+    closingDebit: z.number(),
+    closingCredit: z.number(),
+    consistent: z.boolean(),
+    accounts: z.array(
+      turnoverSumsSchema.extend({ code: z.string(), description: z.string(), ref: z.string() }).passthrough(),
+    ),
+    note: z.string().optional(),
+    scan: scanSchema,
+  })
+  .passthrough();
+
 const breakdownGroupSchema = z
   .object({
     label: z.string(),

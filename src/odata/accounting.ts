@@ -4,8 +4,15 @@ import { and, cmp, odataGuid, odataString, or } from "./query.js";
 import { CATALOGS, REGISTERS, resolveEntity } from "../config/mapping.js";
 import { requireEntity } from "./publication.js";
 import { buildQuery } from "./query.js";
-import { fetchAllForAggregation } from "./aggregate.js";
+import {
+  AggregateOverflowError,
+  addMeta,
+  emptyMeta,
+  fetchAllForAggregation,
+  type ScanMeta,
+} from "./aggregate.js";
 import type { ODataEntity } from "../types/odata.js";
+import { InputError } from "../errors.js";
 
 /**
  * Аналитика для 1С:Бухгалтерия 3.0 строится на регистре бухгалтерии
@@ -181,6 +188,169 @@ export async function balanceByAccounts(
     `сальдо на ${asOf ?? "сейчас"}`,
   );
   return rows;
+}
+
+/**
+ * Виртуальная таблица «Остатки и обороты» регистра бухгалтерии через OData.
+ *
+ * ВСЁ, что зависит от точного синтаксиса 1С, собрано здесь, в одном месте, чтобы
+ * после живого теста править одну константу, а не инструмент:
+ *  - имя виртуальной таблицы (по документации платформы — BalanceAndTurnovers;
+ *    если конкретная база ответит 404/400 — поменять name, напр. на BalanceAndTurnover);
+ *  - имена path-параметров периода (StartPeriod/EndPeriod — как Period у Balance);
+ *  - имена ресурсных полей (ресурс «Сумма» + суффиксы виртуальной таблицы).
+ */
+export const BALANCE_AND_TURNOVERS = {
+  name: "BalanceAndTurnovers",
+  startParam: "StartPeriod",
+  endParam: "EndPeriod",
+  fields: {
+    openingDr: "СуммаOpeningBalanceDr",
+    openingCr: "СуммаOpeningBalanceCr",
+    turnoverDr: "СуммаTurnoverDr",
+    turnoverCr: "СуммаTurnoverCr",
+    closingDr: "СуммаClosingBalanceDr",
+    closingCr: "СуммаClosingBalanceCr",
+  },
+  /** Поле периода: появляется в строках, только если 1С разбила результат по периодичности. */
+  periodField: "Period",
+} as const;
+
+/**
+ * Следующий календарный день для YYYY-MM-DD — чистая арифметика по компонентам,
+ * без Date/таймзоны (new Date("…") + toISOString() может «съехать» на сутки).
+ * Учитывает конец месяца, года и високосный февраль. Несуществующую дату
+ * (напр. 2025-02-30 — формат её пропускает) отвергает, а не «перекатывает».
+ */
+export function nextDay(ymd: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd);
+  if (!m) throw new InputError(`Дата должна быть в формате YYYY-MM-DD: ${ymd}`);
+  let y = Number(m[1]);
+  let mo = Number(m[2]);
+  let d = Number(m[3]);
+  const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  const dim = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo - 1];
+  if (dim === undefined || d < 1 || d > dim) throw new InputError(`Несуществующая дата: ${ymd}`);
+  if (d < dim) d += 1;
+  else if (mo < 12) {
+    mo += 1;
+    d = 1;
+  } else {
+    y += 1;
+    mo = 1;
+    d = 1;
+  }
+  const pad = (n: number, w = 2): string => String(n).padStart(w, "0");
+  return `${pad(y, 4)}-${pad(mo)}-${pad(d)}`;
+}
+
+/**
+ * Путь к виртуальной таблице «Остатки и обороты» за [from,to] (YYYY-MM-DD, оба включительно).
+ * Параметры — path-параметрами (как Period у Balance), а не через $filter.
+ * EndPeriod — начало СЛЕДУЮЩЕГО дня после `to` (а не to 23:59:59), чтобы не терять
+ * движения последней секунды дня:
+ *   AccountingRegister_Хозрасчетный/BalanceAndTurnovers(StartPeriod=datetime'2026-08-01T00:00:00',EndPeriod=datetime'2026-09-01T00:00:00')
+ */
+export function balanceAndTurnoversPath(reg: string, from: string, to: string): string {
+  const vt = BALANCE_AND_TURNOVERS;
+  return (
+    `${reg}/${vt.name}(` +
+    `${vt.startParam}=datetime'${from}T00:00:00',` +
+    `${vt.endParam}=datetime'${nextDay(to)}T00:00:00')`
+  );
+}
+
+/**
+ * Проверяет, что строки виртуальной таблицы содержат все шесть ресурсных полей.
+ * Иначе (другое имя таблицы/ресурса в конкретной базе) num() тихо дал бы нули,
+ * и неизвестная структура выдала бы «ОСВ из нулей» с consistent:true.
+ * В ошибку идут только ИМЕНА полей строки, не значения.
+ */
+export function assertTurnoverFields(rows: readonly ODataEntity[]): void {
+  const expected = Object.values(BALANCE_AND_TURNOVERS.fields);
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i] as Record<string, unknown>;
+    const missing = expected.filter((f) => !Object.prototype.hasOwnProperty.call(r, f));
+    if (missing.length === 0) continue;
+    throw new Error(
+      `Виртуальная таблица ${BALANCE_AND_TURNOVERS.name} вернула строки несовместимой структуры ` +
+        `(строка #${i + 1}): нет полей ${missing.join(", ")}. ` +
+        `Фактические поля строки: ${Object.keys(r).join(", ") || "(нет)"}. ` +
+        `Проверьте BALANCE_AND_TURNOVERS в src/odata/accounting.ts.`,
+    );
+  }
+}
+
+/** $filter по набору счетов и (необязательно) организации — фильтрует сама 1С. */
+export function accountsOrgFilter(accountKeys: readonly string[], orgKey?: string): string | undefined {
+  return (
+    and(
+      or(...accountKeys.map((k) => cmp("Account_Key", "eq", odataGuid(k)))),
+      orgKey ? cmp("Организация_Key", "eq", odataGuid(orgKey)) : undefined,
+    ) || undefined
+  );
+}
+
+/**
+ * Сколько GUID-ов счетов кладём в один $filter. Широкий префикс (напр. «9») даёт
+ * десятки субсчетов — длинный OR упирается в лимит длины URL веб-сервера.
+ */
+export const ACCOUNT_FILTER_BATCH = 40;
+
+/**
+ * Строки «Остатков и оборотов» Хозрасчетного за период по набору счетов (+орг).
+ *
+ * Безопасность итога: каждая пачка счетов — через fetchAllForAggregation (громкое
+ * переполнение), и суммарное число строк по всем пачкам тоже сверяется с тем же
+ * потолком analyticsMaxRows. Частичной выборки наружу не уходит — только ошибка.
+ */
+export async function turnoversByAccounts(
+  conn: Connection,
+  accountKeys: readonly string[],
+  from: string,
+  to: string,
+  orgKey?: string,
+): Promise<{ rows: ODataEntity[]; meta: ScanMeta }> {
+  if (accountKeys.length === 0) return { rows: [], meta: emptyMeta() };
+  const reg = await requireEntity(conn, REGISTERS.accounting, "Регистр бухгалтерии «Хозрасчётный»");
+  const path = balanceAndTurnoversPath(reg, from, to);
+  const cap = conn.behavior.analyticsMaxRows;
+  const period = `${from}..${to}`;
+
+  let rows: ODataEntity[] = [];
+  let meta = emptyMeta();
+  for (let i = 0; i < accountKeys.length; i += ACCOUNT_FILTER_BATCH) {
+    const batch = accountKeys.slice(i, i + ACCOUNT_FILTER_BATCH);
+    // Без $select: 1С группирует виртуальную таблицу по выбранным полям, и
+    // $select=Account_Key,… свернул бы сальдо по субконто. Нужны строки по всем
+    // измерениям/субконто — как развёрнутое сальдо в стандартной ОСВ.
+    const part = await fetchAllForAggregation(
+      conn,
+      path,
+      { filter: accountsOrgFilter(batch, orgKey) },
+      period,
+    );
+    rows = rows.concat(part.rows);
+    meta = addMeta(meta, part.meta);
+    if (rows.length > cap) throw new AggregateOverflowError(path, cap, period);
+  }
+
+  // Структура ответа должна совпадать с ожидаемой — до любой агрегации.
+  assertTurnoverFields(rows);
+
+  // Защита от молча неверного сальдо: если 1С вернула разбивку по периодичности,
+  // начальные/конечные остатки подпериодов сложились бы с задвоением.
+  const periods = new Set(
+    rows.map((r) => r[BALANCE_AND_TURNOVERS.periodField]).filter((p) => p !== undefined && p !== null),
+  );
+  if (periods.size > 1) {
+    throw new Error(
+      `Виртуальная таблица ${BALANCE_AND_TURNOVERS.name} вернула разбивку по периодам ` +
+        `(${periods.size} значений ${BALANCE_AND_TURNOVERS.periodField}) — остатки нельзя сложить. ` +
+        `Проверьте параметры виртуальной таблицы (periodicity) в src/odata/accounting.ts.`,
+    );
+  }
+  return { rows, meta };
 }
 
 /**
