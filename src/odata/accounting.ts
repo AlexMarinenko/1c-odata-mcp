@@ -572,15 +572,17 @@ export async function requireDocumentEntity(conn: Connection, documentEntity: st
 
 /**
  * Читает шапку документа (только GET). Несуществующий Ref_Key — явная ошибка
- * not_found, а не «пустые проводки».
+ * not_found, а не «пустые проводки». fields — какие поля запросить (берутся только
+ * те, что есть в $metadata данного вида документа); по умолчанию DOCUMENT_HEADER_FIELDS.
  */
 export async function readDocumentHeader(
   conn: Connection,
   em: EntityMeta,
   ref: string,
+  fields: readonly string[] = DOCUMENT_HEADER_FIELDS,
 ): Promise<ODataEntity> {
   const props = propNames(em);
-  const select = DOCUMENT_HEADER_FIELDS.filter((f) => props.has(f));
+  const select = fields.filter((f) => props.has(f));
   const path = `${em.entitySet}(${odataGuid(ref)})${buildQuery({ select })}`;
   try {
     const doc = await conn.client.getEntity(path);

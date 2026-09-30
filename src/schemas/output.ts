@@ -374,6 +374,76 @@ export const getDocumentPostingsResultSchema = z
   })
   .passthrough();
 
+/** read.audit.get_document_history — хронология документа (только доказуемое). */
+const derivedTimestampSchema = z
+  .object({
+    value: z.string(),
+    source: z.string(),
+    confidence: z.enum(["verified", "derived", "uncertain"]),
+    description: z.string().optional(),
+  })
+  .passthrough();
+
+export const getDocumentHistoryResultSchema = z
+  .object({
+    database: z.string(),
+    document: z
+      .object({
+        entitySet: z.string(),
+        ref: z.string(),
+        number: z.string().optional(),
+        posted: z.boolean().optional(),
+        deletionMark: z.boolean().optional(),
+        organization: z.string().optional(),
+        organizationRef: z.string().optional(),
+        operation: z.string().optional(),
+        state: z.string().optional(),
+        dataVersion: z.string().optional(),
+      })
+      .passthrough(),
+    timestamps: z
+      .object({
+        documentDate: z.string().optional(),
+        refCreatedAt: derivedTimestampSchema.optional(),
+        // executedAt / modifiedAt через стандартный OData недоступны — в ответе их нет.
+      })
+      .passthrough(),
+    responsible: z
+      .object({
+        ref: z.string(),
+        name: z.string().optional(),
+        resolution: z.enum(["resolved", "not_found", "catalog_not_published", "lookup_failed"]),
+        source: z.string(),
+        detail: z.string().optional(),
+      })
+      .passthrough()
+      .optional(),
+    accountingMovements: z
+      .object({
+        status: z.enum(["exists", "none", "unsupported", "error"]),
+        exists: z.boolean().optional(),
+        source: z.string().optional(),
+        filter: z.string().optional(),
+        detail: z.string().optional(),
+      })
+      .passthrough(),
+    evidence: z.array(
+      z
+        .object({
+          sourceEntity: z.string(),
+          sourceRef: z.string().optional(),
+          sourceField: z.string(),
+          timestamp: z.string().optional(),
+          description: z.string(),
+          details: z.record(z.unknown()).optional(),
+        })
+        .passthrough(),
+    ),
+    limitations: z.array(z.string()),
+    scan: scanSchema,
+  })
+  .passthrough();
+
 const breakdownGroupSchema = z
   .object({
     label: z.string(),
