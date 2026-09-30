@@ -2,7 +2,7 @@ import type { Connection } from "../context.js";
 import { fetchAll } from "./pagination.js";
 import { and, cmp, odataGuid, odataString, or } from "./query.js";
 import { CATALOGS, REGISTERS, resolveEntity } from "../config/mapping.js";
-import { requireEntity } from "./publication.js";
+import { ensurePublished, requireEntity } from "./publication.js";
 import { buildQuery } from "./query.js";
 import {
   AggregateOverflowError,
@@ -11,8 +11,9 @@ import {
   fetchAllForAggregation,
   type ScanMeta,
 } from "./aggregate.js";
-import type { ODataEntity } from "../types/odata.js";
+import type { EntityMeta, ODataEntity } from "../types/odata.js";
 import { InputError } from "../errors.js";
+import { ODataError } from "./errors.js";
 
 /**
  * Аналитика для 1С:Бухгалтерия 3.0 строится на регистре бухгалтерии
@@ -394,3 +395,334 @@ export function num(v: unknown): number {
 }
 
 export { and, cmp };
+
+// ─── Проводки одного документа (регистратора) ─────────────────────────────────
+
+/** GUID без фигурных скобок (Ref_Key документа). */
+export const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/**
+ * ЗАПИСИ регистра бухгалтерии (не виртуальные таблицы) — то, как их публикует 1С.
+ *
+ * ⚠ НЕ ПРОВЕРЕНО НА ЖИВОЙ 1С (LIVE-UNVERIFIED). Это ПРЕДПОЛОЖЕНИЕ, а не факт:
+ *   - что записи регистра опубликованы как EntitySet «AccountingRegister_Хозрасчетный_RecordType»;
+ *   - что в нём есть поля Recorder / Recorder_Type / Period / AccountDr_Key / AccountCr_Key / Сумма.
+ * Юнит-тесты (test/postings.test.ts) ЭМУЛИРУЮТ именно эту ожидаемую структуру и
+ * поэтому совместимость с реальной 1С НЕ подтверждают. Реальное представление
+ * определяется по $metadata живой базы после развёртывания.
+ *
+ * Защита от неверного предположения: перед запросом fetchRegistrarPostings сверяет
+ * имена полей с $metadata конкретной базы (resolvePostingsSource) и при расхождении
+ * падает с перечнем фактических ИМЁН полей — без запроса к регистру и без какого-либо
+ * запасного пути с выкачкой всего регистра. Всё, что может понадобиться поправить
+ * после живого теста, собрано здесь и в recorderFilter() — больше нигде.
+ */
+export const REGISTER_RECORDS = {
+  /**
+   * Кандидаты EntitySet с записями регистра — по порядку. Берётся первый,
+   * опубликованный в $metadata И содержащий все обязательные поля + поле регистратора.
+   * «<Регистр>_RecordType» — запись регистра по правилам именования стандартного
+   * интерфейса OData; сам «<Регистр>» — набор записей (Recorder/Recorder_Type/RecordSet),
+   * он пройдёт проверку, только если база публикует поля записи плоско.
+   */
+  entitySetSuffixes: ["_RecordType", ""],
+  /** Поле регистратора (составной тип: значение GUID + отдельное поле _Type). */
+  recorder: "Recorder",
+  recorderType: "Recorder_Type",
+  /** Без этих полей строка не является проводкой — их отсутствие = громкая ошибка. */
+  required: {
+    period: "Period",
+    accountDr: "AccountDr_Key",
+    accountCr: "AccountCr_Key",
+    amount: "Сумма",
+  },
+  /** Используются, если есть в $metadata регистра. */
+  optional: {
+    lineNumber: "LineNumber",
+    active: "Active",
+    organization: "Организация_Key",
+    quantityDr: "КоличествоDr",
+    quantityCr: "КоличествоCr",
+    currencyAmountDr: "ВалютнаяСуммаDr",
+    currencyAmountCr: "ВалютнаяСуммаCr",
+    divisionDr: "ПодразделениеDr_Key",
+    divisionCr: "ПодразделениеCr_Key",
+    content: "Содержание",
+  },
+  /** Субконто записи: ExtDimensionDr1..3 / ExtDimensionCr1..3 (+ поле <имя>_Type). */
+  extDimensionRe: /^ExtDimension(Dr|Cr)(\d+)$/,
+} as const;
+
+/**
+ * ЕДИНСТВЕННОЕ место с синтаксисом отбора по регистратору.
+ *
+ * ⚠ НЕ ПРОВЕРЕНО НА ЖИВОЙ 1С (LIVE-UNVERIFIED). Синтаксис
+ *     Recorder eq cast(guid'…', 'Document_…')
+ * — ПРЕДПОЛОЖЕНИЕ по аналогии с прочими полями составного типа стандартного
+ * интерфейса OData 1С (регистратор Хозрасчетного — составного типа). Фейковая 1С
+ * в юнит-тестах разбирает ровно этот синтаксис, поэтому тесты его совместимость
+ * с реальной 1С НЕ подтверждают.
+ *
+ * Если живая 1С отвергнет фильтр (400) или вернёт не те записи — инструмент обязан
+ * упасть явно (ODataError / проверка assertPostingRows). Никакого альтернативного
+ * синтаксиса и никакого отката к выборке всего регистра здесь нет намеренно:
+ * реальное представление определяем по живой базе и правим только эту функцию.
+ */
+export function recorderFilter(documentEntity: string, ref: string): string {
+  return cmp(REGISTER_RECORDS.recorder, "eq", `cast(${odataGuid(ref)}, ${odataString(documentEntity)})`);
+}
+
+/** Субконто одной стороны проводки, найденное в $metadata. */
+export interface ExtDimensionField {
+  side: "Dr" | "Cr";
+  index: number;
+  field: string;
+  typeField?: string;
+}
+
+export interface PostingsSource {
+  entitySet: string;
+  properties: ReadonlySet<string>;
+  extDimensions: ExtDimensionField[];
+}
+
+const propNames = (e: EntityMeta | undefined): Set<string> =>
+  new Set((e?.properties ?? []).map((p) => p.name));
+
+/**
+ * Находит по $metadata EntitySet записей регистра бухгалтерии и проверяет, что в нём
+ * есть поле регистратора и все обязательные поля проводки. Ничего не угадывает:
+ * не нашлось — ошибка с ИМЕНАМИ полей кандидатов (значений в ней нет).
+ */
+export async function resolvePostingsSource(conn: Connection): Promise<PostingsSource> {
+  const reg = await requireEntity(conn, REGISTERS.accounting, "Регистр бухгалтерии «Хозрасчётный»");
+  const meta = await conn.getMetadata();
+  const needed = [REGISTER_RECORDS.recorder, ...Object.values(REGISTER_RECORDS.required)];
+  const report: string[] = [];
+  for (const suffix of REGISTER_RECORDS.entitySetSuffixes) {
+    const set = `${reg}${suffix}`;
+    const em = meta.entities.get(set);
+    if (!em) {
+      report.push(`${set}: не опубликован`);
+      continue;
+    }
+    const props = propNames(em);
+    const missing = needed.filter((f) => !props.has(f));
+    if (missing.length > 0) {
+      report.push(`${set}: нет полей ${missing.join(", ")}; есть: ${[...props].join(", ") || "(нет)"}`);
+      continue;
+    }
+    const extDimensions: ExtDimensionField[] = [];
+    for (const p of props) {
+      const m = REGISTER_RECORDS.extDimensionRe.exec(p);
+      if (!m) continue;
+      const typeField = `${p}_Type`;
+      extDimensions.push({
+        side: m[1] as "Dr" | "Cr",
+        index: Number(m[2]),
+        field: p,
+        ...(props.has(typeField) ? { typeField } : {}),
+      });
+    }
+    extDimensions.sort((a, b) => a.index - b.index);
+    return { entitySet: set, properties: props, extDimensions };
+  }
+  throw new Error(
+    `В $metadata не найден набор записей регистра бухгалтерии с полем регистратора и полями проводки. ` +
+      `Проверено: ${report.join(" | ")}. Проверьте REGISTER_RECORDS в src/odata/accounting.ts.`,
+  );
+}
+
+/** Поля шапки документа, которые берём, если они есть в $metadata данного вида документа. */
+export const DOCUMENT_HEADER_FIELDS = [
+  "Ref_Key",
+  "Number",
+  "Date",
+  "Posted",
+  "DeletionMark",
+  "Организация_Key",
+  "ВидОперации",
+  "Состояние",
+  "Комментарий",
+] as const;
+
+/**
+ * Проверяет, что documentEntity — именно документ из $metadata (не справочник, не
+ * табличная часть документа, не произвольная сущность). Возвращает его описание.
+ */
+export async function requireDocumentEntity(conn: Connection, documentEntity: string): Promise<EntityMeta> {
+  if (!documentEntity.startsWith("Document_")) {
+    throw new InputError(
+      `"${documentEntity}" — не документ: ожидается имя вида Document_<Имя> (см. list_entities, class=document).`,
+    );
+  }
+  const meta = await conn.getMetadata();
+  ensurePublished(new Set(meta.entities.keys()), documentEntity);
+  const em = meta.entities.get(documentEntity)!;
+  const props = propNames(em);
+  // Табличная часть документа (Document_X_Товары) тоже class=document, но у неё
+  // есть LineNumber и составной ключ — регистратором она быть не может.
+  if (em.class !== "document" || !props.has("Ref_Key") || props.has("LineNumber")) {
+    throw new InputError(
+      `"${documentEntity}" — не документ (табличная часть или иной объект). Укажите сам документ, напр. Document_РеализацияТоваровУслуг.`,
+    );
+  }
+  return em;
+}
+
+/**
+ * Читает шапку документа (только GET). Несуществующий Ref_Key — явная ошибка
+ * not_found, а не «пустые проводки».
+ */
+export async function readDocumentHeader(
+  conn: Connection,
+  em: EntityMeta,
+  ref: string,
+): Promise<ODataEntity> {
+  const props = propNames(em);
+  const select = DOCUMENT_HEADER_FIELDS.filter((f) => props.has(f));
+  const path = `${em.entitySet}(${odataGuid(ref)})${buildQuery({ select })}`;
+  try {
+    const doc = await conn.client.getEntity(path);
+    if (!doc || typeof doc !== "object") throw notFound(em.entitySet, ref);
+    return doc;
+  } catch (e) {
+    if (e instanceof ODataError && e.kind === "not_found") throw notFound(em.entitySet, ref);
+    throw e;
+  }
+}
+
+const notFound = (entitySet: string, ref: string): ODataError =>
+  new ODataError({
+    kind: "not_found",
+    message: `Документ ${entitySet} с Ref_Key ${ref} не найден в базе.`,
+  });
+
+const normGuid = (v: unknown): string =>
+  typeof v === "string" ? v.replace(/[{}]/g, "").trim().toLowerCase() : "";
+
+const stripNs = (t: string): string => t.slice(t.lastIndexOf(".") + 1);
+
+/**
+ * Проверяет строки регистра ДО любой агрегации:
+ *  - все обязательные поля проводки присутствуют (иначе num() дал бы нули);
+ *  - каждая строка принадлежит именно этому регистратору (защита от молча
+ *    неприменённого серверного отбора — частичные/чужие проводки хуже ошибки);
+ *  - номера строк не повторяются (иначе $skip-листание задвоило записи).
+ * В ошибку идут только ИМЕНА полей и номер строки, не значения.
+ */
+export function assertPostingRows(
+  rows: readonly ODataEntity[],
+  documentEntity: string,
+  ref: string,
+  source: PostingsSource,
+): void {
+  const required = [
+    REGISTER_RECORDS.recorder,
+    ...Object.values(REGISTER_RECORDS.required),
+    ...(source.properties.has(REGISTER_RECORDS.recorderType) ? [REGISTER_RECORDS.recorderType] : []),
+  ];
+  const want = normGuid(ref);
+  const lineField = REGISTER_RECORDS.optional.lineNumber;
+  const seenLines = new Set<string>();
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i] as Record<string, unknown>;
+    const missing = required.filter((f) => r[f] === undefined || r[f] === null);
+    if (missing.length > 0) {
+      throw new Error(
+        `Записи ${source.entitySet} несовместимой структуры (строка #${i + 1}): нет полей ${missing.join(", ")}. ` +
+          `Фактические поля строки: ${Object.keys(r).join(", ") || "(нет)"}. ` +
+          `Проверьте REGISTER_RECORDS в src/odata/accounting.ts.`,
+      );
+    }
+    const recType = r[REGISTER_RECORDS.recorderType];
+    const typeOk =
+      recType === undefined || (typeof recType === "string" && stripNs(recType) === documentEntity);
+    if (normGuid(r[REGISTER_RECORDS.recorder]) !== want || !typeOk) {
+      throw new Error(
+        `1С вернула запись ${source.entitySet} другого регистратора (строка #${i + 1}): серверный отбор ` +
+          `по регистратору не применился как ожидалось. Проверьте recorderFilter() в src/odata/accounting.ts.`,
+      );
+    }
+    if (r[lineField] !== undefined && r[lineField] !== null) {
+      const ln = String(r[lineField]);
+      if (seenLines.has(ln)) {
+        throw new Error(
+          `Повтор ${lineField} в записях ${source.entitySet} (строка #${i + 1}): постраничная выборка ` +
+            `неустойчива, набор проводок может быть неполным.`,
+        );
+      }
+      seenLines.add(ln);
+    }
+  }
+}
+
+/**
+ * Все записи регистра Хозрасчетный по одному регистратору — отбор на стороне 1С.
+ * Через fetchAllForAggregation: полная выборка с громким переполнением
+ * (AggregateOverflowError) вместо частичного набора. Никакого «плана Б» с
+ * выкачкой всего регистра: ошибка серверного отбора всплывает как есть.
+ */
+export async function fetchRegistrarPostings(
+  conn: Connection,
+  documentEntity: string,
+  ref: string,
+): Promise<{ rows: ODataEntity[]; meta: ScanMeta; source: PostingsSource; filter: string }> {
+  const source = await resolvePostingsSource(conn);
+  const filter = recorderFilter(documentEntity, ref);
+  const lineField = REGISTER_RECORDS.optional.lineNumber;
+  // Устойчивый порядок для $skip-листания: у одного регистратора номер строки уникален.
+  const orderby = source.properties.has(lineField) ? `${lineField} asc` : undefined;
+  // Без $select: состав полей записи зависит от конфигурации (субконто, _Type-поля),
+  // а лишнее поле в $select — это 400. Проверка структуры — assertPostingRows.
+  const { rows, meta } = await fetchAllForAggregation(
+    conn,
+    source.entitySet,
+    { filter, ...(orderby ? { orderby } : {}) },
+    `документ ${documentEntity} ${ref}`,
+  );
+  assertPostingRows(rows, documentEntity, ref, source);
+  return { rows, meta, source, filter };
+}
+
+/**
+ * Счета плана «Хозрасчётный» по Ref_Key — пачками (один запрос на ACCOUNT_FILTER_BATCH
+ * счетов), а не запросом на каждую проводку. Несопоставленный счёт — ошибка.
+ */
+export async function accountsByRef(conn: Connection, keys: Iterable<string>): Promise<Map<string, Account>> {
+  const unique = [...new Set([...keys].filter((k) => k && k !== EMPTY_GUID))];
+  const result = new Map<string, Account>();
+  if (unique.length === 0) return result;
+  const chart = await requireEntity(conn, CHART_CANDIDATES, "План счетов «Хозрасчётный»");
+  for (let i = 0; i < unique.length; i += ACCOUNT_FILTER_BATCH) {
+    const batch = unique.slice(i, i + ACCOUNT_FILTER_BATCH);
+    const { rows } = await fetchAll(
+      conn.client,
+      chart,
+      {
+        filter: or(...batch.map((k) => cmp("Ref_Key", "eq", odataGuid(k)))),
+        select: ["Ref_Key", "Code", "Description"],
+      },
+      batch.length,
+      batch.length,
+    );
+    for (const r of rows) {
+      const key = String(r["Ref_Key"] ?? "");
+      result.set(normGuid(key), {
+        key,
+        code: String(r["Code"] ?? ""),
+        description: String(r["Description"] ?? ""),
+      });
+    }
+  }
+  const missing = unique.filter((k) => !result.has(normGuid(k)));
+  if (missing.length > 0) {
+    throw new Error(`Счета не найдены в плане счетов «Хозрасчётный» по Ref_Key: ${missing.join(", ")}.`);
+  }
+  return result;
+}
+
+/** Ключ для поиска в карте accountsByRef (регистр GUID и скобки не важны). */
+export const accountLookupKey = normGuid;
+
+export { EMPTY_GUID };

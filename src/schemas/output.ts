@@ -297,6 +297,83 @@ export const getAccountTurnoverResultSchema = z
   })
   .passthrough();
 
+const postingDimensionSchema = z
+  .object({
+    index: z.number(),
+    type: z.string().optional(),
+    ref: z.string().optional(),
+    value: z.string().optional(),
+  })
+  .passthrough();
+
+/** Сторона проводки (Дт или Кт); null — у стороны нет счёта (забалансовая проводка). */
+const postingSideSchema = z
+  .object({
+    accountCode: z.string(),
+    accountName: z.string(),
+    accountRef: z.string(),
+    dimensions: z.array(postingDimensionSchema).optional(),
+    divisionRef: z.string().optional(),
+  })
+  .passthrough()
+  .nullable();
+
+/** get_document_postings: проводки одного регистратора из регистра Хозрасчетный. */
+export const getDocumentPostingsResultSchema = z
+  .object({
+    database: z.string(),
+    document: z
+      .object({
+        entitySet: z.string(),
+        ref: z.string(),
+        number: z.string().optional(),
+        date: z.string().optional(),
+        posted: z.boolean().optional(),
+        deletionMark: z.boolean().optional(),
+        organization: z.string().optional(),
+        organizationRef: z.string().optional(),
+        operation: z.string().optional(),
+        state: z.string().optional(),
+        comment: z.string().optional(),
+      })
+      .passthrough(),
+    postingsCount: z.number(),
+    debitTotal: z.number(),
+    creditTotal: z.number(),
+    postings: z.array(
+      z
+        .object({
+          period: z.string(),
+          lineNumber: z.number().optional(),
+          active: z.boolean().optional(),
+          debit: postingSideSchema,
+          credit: postingSideSchema,
+          amount: z.number(),
+          quantityDebit: z.number().optional(),
+          quantityCredit: z.number().optional(),
+          currencyAmountDebit: z.number().optional(),
+          currencyAmountCredit: z.number().optional(),
+          organizationRef: z.string().optional(),
+          content: z.string().optional(),
+        })
+        .passthrough(),
+    ),
+    byCorrespondence: z.array(
+      z
+        .object({
+          debitAccount: z.string().nullable(),
+          creditAccount: z.string().nullable(),
+          amount: z.number(),
+          entries: z.number(),
+        })
+        .passthrough(),
+    ),
+    note: z.string().optional(),
+    source: z.object({ entitySet: z.string(), filter: z.string() }).passthrough(),
+    scan: scanSchema,
+  })
+  .passthrough();
+
 const breakdownGroupSchema = z
   .object({
     label: z.string(),
