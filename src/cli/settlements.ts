@@ -1,9 +1,13 @@
+#!/usr/bin/env node
 /**
  * Диагностика подключения и сверка взаиморасчётов двух сторон по ОСВ (только чтение).
  *
- * Запуск на сервере MCP, из каталога проекта:
- *   node --env-file=.env dist/scripts/probe-settlements.js                # только диагностика
- *   node --env-file=.env dist/scripts/probe-settlements.js \
+ * Входит в пакет как исполняемый файл `1c-odata-mcp-settlements` (в отличие от probe-скриптов
+ * из dist/scripts, которые в пакет не попадают). Настройки — те же переменные окружения, что у
+ * сервера (ODATA_BASE_URL / ODATA_DB_<ИМЯ>_…).
+ *
+ *   1c-odata-mcp-settlements                                   # только диагностика
+ *   1c-odata-mcp-settlements \
  *     --org-a "<клиника>" --org-b "<ИП>" \
  *     --cp-in-a "<ИП как контрагент>" --cp-in-b "<клиника как контрагент>" \
  *     --from 2025-01-01 --to 2025-01-31 [--monthly] [--database buh]
@@ -235,7 +239,7 @@ async function main(): Promise<void> {
   const server = createServer(ctx);
   const [s, c] = InMemoryTransport.createLinkedPair();
   await server.connect(s);
-  const client = new Client({ name: "probe-settlements", version: "0" });
+  const client = new Client({ name: "1c-odata-mcp-settlements", version: "0" });
   await client.connect(c);
 
   await diagnoseDatabases(ctx);
@@ -260,7 +264,7 @@ async function main(): Promise<void> {
   }
 
   if (!args["org-a"] || !args["cp-in-a"]) {
-    line("\nСверка не запускалась: укажите --org-a и --cp-in-a (см. шапку скрипта).");
+    line("\nСверка не запускалась: укажите --org-a и --cp-in-a (см. docs/SETTLEMENTS-CHECK.md).");
     return void (await client.close());
   }
 

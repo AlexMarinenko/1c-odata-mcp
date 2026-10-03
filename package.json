@@ -1,13 +1,15 @@
 {
   "name": "1c-odata-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0-megapolis.1",
   "description": "MCP server for 1C:Enterprise (1С) over OData. Ask your accounting database in natural language — debtors, sales, taxes, cash flow — from any MCP client (Claude, Cursor, VS Code, local models…). 55 tools, run with npx, nothing installed inside 1C; read-only by default with opt-in (gated) write.",
   "type": "module",
   "bin": {
-    "1c-odata-mcp": "dist/index.js"
+    "1c-odata-mcp": "dist/index.js",
+    "1c-odata-mcp-settlements": "dist/cli/settlements.js"
   },
   "files": [
     "dist",
+    "!dist/scripts",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
@@ -24,10 +26,10 @@
   "author": "evilbruce666",
   "scripts": {
     "build": "tsc",
+    "prepare": "npm run build",
     "start": "node dist/index.js",
     "dev": "tsc --watch",
     "probe": "node dist/scripts/probe-metadata.js",
-    "probe:settlements": "node dist/scripts/probe-settlements.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
