@@ -11,6 +11,9 @@ import {
   num,
   turnoversByAccounts,
   BALANCE_AND_TURNOVERS,
+  VT_EXT_DIMENSIONS,
+  dimensionRefOf,
+  hasDimensionTypes,
   GUID_RE,
   EMPTY_GUID,
   REGISTER_RECORDS,
@@ -154,6 +157,50 @@ export function aggregateAccountTurnover(
     total.openingDr - total.openingCr + total.turnoverDr - total.turnoverCr ===
     total.closingDr - total.closingCr;
   return { total, byAccount, consistent };
+}
+
+/** Свёрнутый итог одной группы ОСВ вместе с разбивкой по субсчетам. */
+export interface TurnoverGroup {
+  /** Ссылка договора (нижний регистр) или undefined — строки без договора. */
+  contractRef: string | undefined;
+  total: TurnoverCents;
+  byAccount: Array<{ account: Account; sums: TurnoverCents }>;
+  consistent: boolean;
+  rows: number;
+}
+
+/**
+ * Разбивка ОСВ по договорам. Договор берётся из субконто типа `contractEntitySet`.
+ * Внутри договора Dr и Cr по-прежнему копятся раздельно по строкам виртуальной таблицы,
+ * поэтому сальдо остаётся развёрнутым: долг по одному документу расчётов не сворачивается
+ * с авансом по другому, как и в итоге без разбивки.
+ *
+ * Строка без полей типа субконто — ошибка: определить договор «по номеру субконто» значило бы
+ * молча отнести суммы не к тому договору.
+ */
+export function aggregateTurnoverByContract(
+  rows: readonly ODataEntity[],
+  accounts: readonly Account[],
+  contractEntitySet: string,
+): TurnoverGroup[] {
+  const buckets = new Map<string, { ref: string | undefined; rows: ODataEntity[] }>();
+  rows.forEach((r, i) => {
+    if (!hasDimensionTypes(r)) {
+      throw new Error(
+        `Строка #${i + 1} виртуальной таблицы ${BALANCE_AND_TURNOVERS.name} не содержит полей типа субконто ` +
+          `(${VT_EXT_DIMENSIONS.typeField(1)}…): разбивка по договорам невозможна. ` +
+          `Фактические поля строки: ${Object.keys(r).join(", ") || "(нет)"}.`,
+      );
+    }
+    const ref = dimensionRefOf(r, contractEntitySet);
+    const key = ref ?? "";
+    const bucket = buckets.get(key) ?? { ref, rows: [] };
+    bucket.rows.push(r);
+    buckets.set(key, bucket);
+  });
+  return [...buckets.values()]
+    .map((b) => ({ contractRef: b.ref, ...aggregateAccountTurnover(b.rows, accounts), rows: b.rows.length }))
+    .sort((a, b) => (a.contractRef ?? "\uffff").localeCompare(b.contractRef ?? "\uffff"));
 }
 
 // ─── Проводки документа ───────────────────────────────────────────────────────
@@ -588,7 +635,9 @@ export function registerRegisterTools(server: McpServer, ctx: ServerContext): vo
         "сальдо на конец Дт/Кт — итогом и по субсчетам. account — код счёта или префикс " +
         "(«51», «60», «62», «90.01»): берутся все субсчета, код которых начинается с него. " +
         "Сальдо развёрнутое по аналитике (измерения и субконто), как в стандартной ОСВ по счёту. " +
-        "Можно ограничить организацией. Период — даты YYYY-MM-DD включительно.",
+        "Можно ограничить организацией, контрагентом (counterpartyRef) и договором (contractRef); " +
+        "breakdown=contract добавляет разбивку по договорам с тем же развёрнутым сальдо. " +
+        "Период — даты YYYY-MM-DD включительно.",
       inputSchema: {
         database: databaseField,
         organization: organizationField,
@@ -601,15 +650,59 @@ export function registerRegisterTools(server: McpServer, ctx: ServerContext): vo
           .describe("Код счёта или префикс субсчетов, напр. 51, 60, 62, 90.01"),
         from: dateField("Дата начала периода"),
         to: dateField("Дата конца периода"),
+        counterpartyRef: z
+          .string()
+          .regex(GUID_RE, "Ref_Key контрагента — GUID")
+          .optional()
+          .describe(
+            "Ref_Key контрагента: оставить только аналитику этого контрагента (см. find_counterparty)",
+          ),
+        contractRef: z
+          .string()
+          .regex(GUID_RE, "Ref_Key договора — GUID")
+          .optional()
+          .describe("Ref_Key договора: оставить только аналитику этого договора"),
+        breakdown: z
+          .enum(["contract"])
+          .optional()
+          .describe("contract — дополнительно разбить ОСВ по договорам (сальдо остаётся развёрнутым)"),
       },
       outputSchema: getAccountTurnoverResultSchema,
     },
-    ({ database, organization, account, from, to }) =>
+    ({ database, organization, account, from, to, counterpartyRef, contractRef, breakdown }) =>
       guard("read.accounting.get_account_turnover", async () => {
         const t0 = Date.now();
         if (from > to) return fail(`Период задан наоборот: from (${from}) позже to (${to}).`);
         const conn = ctx.db(database);
         const org = await orgKeyOf(conn, organization);
+        // Аналитика: ссылка обязана существовать в справочнике. Иначе опечатка в GUID дала бы
+        // «ОСВ из нулей», неотличимую от настоящего отсутствия расчётов.
+        const available = await conn.available();
+        const dimension = async (
+          ref: string | undefined,
+          candidates: readonly string[],
+          label: string,
+        ): Promise<{ entitySet: string; ref: string; name: string } | undefined> => {
+          if (!ref) return undefined;
+          const entitySet = resolveEntity(candidates, available);
+          if (!entitySet) throw new InputError(`Справочник «${label}» не опубликован в OData этой базы.`);
+          // Регистр букв GUID во входе и в ответе базы может различаться.
+          const found = await resolveNames(conn, entitySet, [ref]);
+          const name = [...found.entries()].find(([k]) => k.toLowerCase() === ref.toLowerCase())?.[1];
+          if (name === undefined) {
+            throw new InputError(`${label}: элемент с Ref_Key ${ref} не найден в базе "${conn.cfg.name}".`);
+          }
+          return { entitySet, ref, name };
+        };
+        const counterparty = await dimension(counterpartyRef, CATALOGS.counterparties, "Контрагенты");
+        const contract = await dimension(contractRef, CATALOGS.contracts, "Договоры");
+        const contractSet = resolveEntity(CATALOGS.contracts, available);
+        if (breakdown === "contract" && !contractSet) {
+          throw new InputError(
+            "Справочник договоров не опубликован в OData: разбивка по договорам невозможна.",
+          );
+        }
+        const dimensions = [counterparty, contract].filter((d) => d !== undefined);
         const accounts = await resolveAccounts(conn, [account]);
         if (accounts.length === 0) {
           throw new InputError(`Счёт "${account}" не найден в плане счетов «Хозрасчётный».`);
@@ -622,28 +715,64 @@ export function registerRegisterTools(server: McpServer, ctx: ServerContext): vo
               `Уточните код счёта.`,
           );
         }
-        const { rows, meta } = await turnoversByAccounts(
+        const { rows, meta, dimensionFilter } = await turnoversByAccounts(
           conn,
           accounts.map((a) => a.key),
           from,
           to,
           org.key,
+          dimensions,
         );
         const agg = aggregateAccountTurnover(rows, accounts);
+        const accountsJson = (list: Array<{ account: Account; sums: TurnoverCents }>) =>
+          list.map(({ account: a, sums }) => ({
+            code: a.code,
+            description: a.description,
+            ref: a.key,
+            ...turnoverToRub(sums),
+          }));
+        let contracts: unknown[] | undefined;
+        if (breakdown === "contract" && contractSet) {
+          const groups = aggregateTurnoverByContract(rows, accounts, contractSet);
+          const names = await resolveNames(
+            conn,
+            contractSet,
+            groups.map((g) => g.contractRef).filter((r): r is string => r !== undefined),
+          );
+          // resolveNames отдаёт ключи в регистре базы; сопоставляем без учёта регистра.
+          const nameOf = new Map([...names.entries()].map(([k, v]) => [k.toLowerCase(), v]));
+          contracts = groups.map((g) => ({
+            ref: g.contractRef ?? null,
+            name: g.contractRef ? (nameOf.get(g.contractRef) ?? null) : "(без договора)",
+            ...turnoverToRub(g.total),
+            consistent: g.consistent,
+            rows: g.rows,
+            accounts: accountsJson(g.byAccount),
+          }));
+        }
         return ok({
           database: conn.cfg.name,
           organization: org.name,
           account,
           period: { from, to },
+          ...(counterparty ? { counterparty: { ref: counterparty.ref, name: counterparty.name } } : {}),
+          ...(contract ? { contract: { ref: contract.ref, name: contract.name } } : {}),
+          ...(dimensions.length > 0 ? { dimensionFilter, rowsMatched: rows.length } : {}),
+          balanceDetail:
+            "развёрнутое сальдо: Дт и Кт суммируются раздельно по строкам «Остатков и оборотов» " +
+            "(счёт × измерения × все субконто, включая документ расчётов)",
           ...turnoverToRub(agg.total),
           consistent: agg.consistent,
-          accounts: agg.byAccount.map(({ account: a, sums }) => ({
-            code: a.code,
-            description: a.description,
-            ref: a.key,
-            ...turnoverToRub(sums),
-          })),
-          ...(rows.length === 0 ? { note: "За период нет ни остатков, ни движений по счёту." } : {}),
+          accounts: accountsJson(agg.byAccount),
+          ...(contracts ? { contracts } : {}),
+          ...(rows.length === 0
+            ? {
+                note:
+                  dimensions.length > 0
+                    ? "За период нет ни остатков, ни движений по счёту с такой аналитикой."
+                    : "За период нет ни остатков, ни движений по счёту.",
+              }
+            : {}),
           scan: { rowsScanned: meta.rowsScanned, windows: meta.chunks, elapsedMs: Date.now() - t0 },
         });
       }),

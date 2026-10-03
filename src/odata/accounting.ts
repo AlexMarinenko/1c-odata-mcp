@@ -293,6 +293,81 @@ export function accountsOrgFilter(accountKeys: readonly string[], orgKey?: strin
 }
 
 /**
+ * Субконто в строках виртуальных таблиц Хозрасчётного: ExtDimension1..3 и парное поле
+ * ExtDimensionN_Type («StandardODATA.Catalog_Контрагенты»). Какое по счёту субконто занимает
+ * контрагент или договор, зависит от счёта, поэтому аналитика ищется по ТИПУ, а не по номеру.
+ */
+export const VT_EXT_DIMENSIONS = {
+  count: 3,
+  field: (n: number): string => `ExtDimension${n}`,
+  typeField: (n: number): string => `ExtDimension${n}_Type`,
+  typePrefix: "StandardODATA.",
+} as const;
+
+const dimNumbers = (): number[] => Array.from({ length: VT_EXT_DIMENSIONS.count }, (_, i) => i + 1);
+
+/** Отбор по значению субконто: что ищем (ссылка) и в каком справочнике. */
+export interface DimensionFilter {
+  /** Набор сущностей справочника, напр. Catalog_Контрагенты. */
+  entitySet: string;
+  ref: string;
+}
+
+/**
+ * $filter по субконто на стороне 1С: значение составного типа сравнивается через cast
+ * (тот же синтаксис, что у Recorder в проводках). Перебираются все позиции субконто —
+ * совпасть может только та, где лежит ссылка нужного справочника.
+ */
+export function extDimensionFilter(d: DimensionFilter): string {
+  const literal = `cast(${odataGuid(d.ref)}, ${odataString(d.entitySet)})`;
+  return or(...dimNumbers().map((n) => cmp(VT_EXT_DIMENSIONS.field(n), "eq", literal)));
+}
+
+const typeOf = (row: ODataEntity, n: number): string | undefined => {
+  const t = (row as Record<string, unknown>)[VT_EXT_DIMENSIONS.typeField(n)];
+  return typeof t === "string" && t !== "" ? t : undefined;
+};
+
+const valueOf = (row: ODataEntity, n: number): string | undefined => {
+  const v = (row as Record<string, unknown>)[VT_EXT_DIMENSIONS.field(n)];
+  return typeof v === "string" && v !== "" && v !== EMPTY_GUID ? v.toLowerCase() : undefined;
+};
+
+/** Есть ли у строки хотя бы одно поле типа субконто (иначе аналитику по типу не определить). */
+export function hasDimensionTypes(row: ODataEntity): boolean {
+  return dimNumbers().some((n) => typeOf(row, n) !== undefined);
+}
+
+/**
+ * Ссылка субконто заданного справочника в строке (в нижнем регистре) или undefined.
+ * Определяется ТОЛЬКО по полю типа: без него вернётся undefined, а не догадка по номеру.
+ */
+export function dimensionRefOf(row: ODataEntity, entitySet: string): string | undefined {
+  const wanted = VT_EXT_DIMENSIONS.typePrefix + entitySet;
+  for (const n of dimNumbers()) {
+    if (typeOf(row, n) === wanted) return valueOf(row, n);
+  }
+  return undefined;
+}
+
+/**
+ * Относится ли строка к заданному значению субконто. Сравнение по GUID; если у позиции
+ * указан тип, он обязан совпасть (чужой справочник с тем же GUID не подойдёт).
+ */
+export function rowMatchesDimension(row: ODataEntity, d: DimensionFilter): boolean {
+  const ref = d.ref.toLowerCase();
+  const wanted = VT_EXT_DIMENSIONS.typePrefix + d.entitySet;
+  return dimNumbers().some((n) => {
+    if (valueOf(row, n) !== ref) return false;
+    const type = typeOf(row, n);
+    return type === undefined || type === wanted;
+  });
+}
+
+/** Как был применён отбор по субконто. */
+export type DimensionFilterMode = "none" | "server" | "client";
+
+/**
  * Сколько GUID-ов счетов кладём в один $filter. Широкий префикс (напр. «9») даёт
  * десятки субсчетов — длинный OR упирается в лимит длины URL веб-сервера.
  */
@@ -311,8 +386,45 @@ export async function turnoversByAccounts(
   from: string,
   to: string,
   orgKey?: string,
+  dimensions: readonly DimensionFilter[] = [],
+): Promise<{ rows: ODataEntity[]; meta: ScanMeta; dimensionFilter: DimensionFilterMode }> {
+  if (accountKeys.length === 0) return { rows: [], meta: emptyMeta(), dimensionFilter: "none" };
+  if (dimensions.length === 0) {
+    return { ...(await turnoverRows(conn, accountKeys, from, to, orgKey)), dimensionFilter: "none" };
+  }
+  // Отбор по субконто — на стороне 1С: так не тянется вся аналитика счёта.
+  // Если конкретная база отвергает такой $filter (400), запрос повторяется без него и
+  // отбор делается здесь. В обоих случаях строки дополнительно проверяются по значению
+  // и типу субконто, поэтому чужая аналитика в итог не попадает.
+  let fetched: { rows: ODataEntity[]; meta: ScanMeta };
+  let mode: DimensionFilterMode = "server";
+  try {
+    fetched = await turnoverRows(
+      conn,
+      accountKeys,
+      from,
+      to,
+      orgKey,
+      and(...dimensions.map(extDimensionFilter)),
+    );
+  } catch (e) {
+    if (!(e instanceof ODataError) || e.kind !== "bad_request") throw e;
+    fetched = await turnoverRows(conn, accountKeys, from, to, orgKey);
+    mode = "client";
+  }
+  const rows = fetched.rows.filter((r) => dimensions.every((d) => rowMatchesDimension(r, d)));
+  return { rows, meta: fetched.meta, dimensionFilter: mode };
+}
+
+/** Строки «Остатков и оборотов» по счетам (+орг, + необязательный $filter по субконто). */
+async function turnoverRows(
+  conn: Connection,
+  accountKeys: readonly string[],
+  from: string,
+  to: string,
+  orgKey?: string,
+  extraFilter?: string,
 ): Promise<{ rows: ODataEntity[]; meta: ScanMeta }> {
-  if (accountKeys.length === 0) return { rows: [], meta: emptyMeta() };
   const reg = await requireEntity(conn, REGISTERS.accounting, "Регистр бухгалтерии «Хозрасчётный»");
   const path = balanceAndTurnoversPath(reg, from, to);
   const cap = conn.behavior.analyticsMaxRows;
@@ -328,7 +440,7 @@ export async function turnoversByAccounts(
     const part = await fetchAllForAggregation(
       conn,
       path,
-      { filter: accountsOrgFilter(batch, orgKey) },
+      { filter: and(accountsOrgFilter(batch, orgKey), extraFilter) || undefined },
       period,
     );
     rows = rows.concat(part.rows);

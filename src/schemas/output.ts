@@ -292,6 +292,29 @@ export const getAccountTurnoverResultSchema = z
     accounts: z.array(
       turnoverSumsSchema.extend({ code: z.string(), description: z.string(), ref: z.string() }).passthrough(),
     ),
+    counterparty: z.object({ ref: z.string(), name: z.string() }).optional(),
+    contract: z.object({ ref: z.string(), name: z.string() }).optional(),
+    /** Где применён отбор по субконто: server — в $filter 1С, client — на стороне сервера MCP. */
+    dimensionFilter: z.enum(["none", "server", "client"]).optional(),
+    rowsMatched: z.number().optional(),
+    balanceDetail: z.string().optional(),
+    contracts: z
+      .array(
+        turnoverSumsSchema
+          .extend({
+            ref: z.string().nullable(),
+            name: z.string().nullable(),
+            consistent: z.boolean(),
+            rows: z.number(),
+            accounts: z.array(
+              turnoverSumsSchema
+                .extend({ code: z.string(), description: z.string(), ref: z.string() })
+                .passthrough(),
+            ),
+          })
+          .passthrough(),
+      )
+      .optional(),
     note: z.string().optional(),
     scan: scanSchema,
   })

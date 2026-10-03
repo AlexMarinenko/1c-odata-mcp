@@ -145,7 +145,7 @@ Claude: Готово: контрагент 00-000123, счёт № … (черн
 | `read.counterparty.find_counterparty` / `read.counterparty.get_counterparty` | Поиск контрагента (по названию/ИНН) и его карточка |
 | `read.document.search_documents` / `read.document.get_document` | Поиск документов и документ с табличной частью |
 | `read.analytics.get_debtors` / `read.analytics.get_inventory` | Дебиторка (сч. 62) / остатки товаров (сч. 41/10/43), можно на дату в прошлом (`asOf`) |
-| `read.accounting.get_account_turnover` | ОСВ по счёту за период (`51`, `60`, `90.01`…): сальдо на начало/конец и обороты Дт/Кт, итогом и по субсчетам |
+| `read.accounting.get_account_turnover` | ОСВ по счёту за период (`51`, `60`, `90.01`…): сальдо на начало/конец и обороты Дт/Кт, итогом и по субсчетам; отбор по контрагенту (`counterpartyRef`) и договору (`contractRef`), разбивка по договорам (`breakdown: "contract"`), сальдо развёрнутое |
 | `read.accounting.get_document_postings` | Проводки одного документа (любого `Document_*`) из регистра Хозрасчетный: Дт/Кт с кодами счетов и субконто, суммы, итоги и свод по корреспонденциям. Пример: `{"documentEntity": "Document_РегламентнаяОперация", "documentRef": "919a75d1-7f6a-11f1-86c3-74563c4bf0d1"}` |
 | `read.audit.get_document_history` | Хронология документа для аудита: учётная дата (`documentDate`) отдельно от метки генерации `Ref_Key` из UUIDv1 (`refCreatedAt`, derived), ответственный, `DataVersion` как есть, наличие движений в Хозрасчетном, evidence и limitations. Фактическое время выполнения/изменения через стандартный OData недоступно — не возвращается |
 | `read.analytics.get_sales` / `read.analytics.get_cashflow` | Продажи за период / движение денег (банк + касса) |
